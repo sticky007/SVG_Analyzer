@@ -8,12 +8,12 @@ A SVG decoder that detects and decrypts multiple encryption variants used in SVG
 
 ## Supported Encryption Types
 
-| Type | Method | Detection Pattern |
-|------|--------|-------------------|
-| **Type 1** | Simple XOR | `String.fromCharCode` key |
-| **Type 2** | LCG + Feistel Cipher | `data-t` + `data-*` attributes |
-| **Type 3** | DNA Encoding + Fibonacci XOR | `xlink:href` Base64 with ACGT |
-| **Type 4** | Base64 + Dual-Key XOR | Split hex keys + obfuscated eval |
+| Type | Method |
+|------|--------|
+| **Type 1** | Simple XOR | 
+| **Type 2** | LCG + Feistel Cipher |
+| **Type 3** | DNA Encoding + Fibonacci XOR |
+| **Type 4** | Base64 + Dual-Key XOR | 
 
 ---
 
