@@ -20,10 +20,9 @@ A SVG decoder that detects and decrypts multiple encryption variants used in SVG
 ## Features
 
 - Auto-detection of encryption type and parameters
-- Universal attribute parsing (handles `data-nx`, `data-xx`, `data-*`, etc.)
+- Attribute parsing 
 - Victim email extraction from multiple formats
 - IOC extraction (C2 domains, URLs)
-- Behavior analysis (redirects, script injection, C2 communication)
 - Quick summary with key findings
 
 ---
