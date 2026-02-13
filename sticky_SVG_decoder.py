@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Sticky Afrojack - SVG Malware Decoder
+Sticky Afrojack - SVG Decoder
 Uncover The Hidden Poison
 
-Universal decoder for SVG-based malware with encrypted payloads.
-Supports multiple encryption types and attribute variations.
+Decoder for suspicious SVG file delivered via email.
 
 Author: Sticky Afrojack
 Email: sticky.afrojack@proton.me
