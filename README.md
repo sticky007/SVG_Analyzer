@@ -1,4 +1,4 @@
-# Sticky Afrojack SVG Decoder
+# Sticky Afrojack's SVG Decoder
 
 **Uncover The Hidden Poison**
 
