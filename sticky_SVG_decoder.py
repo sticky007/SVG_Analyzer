@@ -17,6 +17,9 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime
+from collections import Counter
+import string
+import math
 
 __author__ = "Sticky Afrojack"
 __email__ = "sticky.afrojack@proton.me"
@@ -84,21 +87,54 @@ class XORKey:
         return f"Type: {self.type}, Value: {self.value}, Source: {self.source}"
 
 # ============================================================================
-# TYPE 1: SIMPLE XOR DECODER
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def calculate_entropy(data):
+    """Calculate Shannon entropy of data to determine if it's likely text"""
+    if not data:
+        return 0
+    counter = Counter(data.encode() if isinstance(data, str) else data)
+    total = len(data.encode() if isinstance(data, str) else data)
+    entropy = 0
+    for count in counter.values():
+        p = count / total
+        entropy -= p * (p and math.log2(p) or 0)
+    return entropy
+
+def is_likely_code(text):
+    """Check if decoded text looks like valid code/markup"""
+    text_lower = text.lower()
+    
+    # Common code keywords and patterns
+    code_signatures = [
+        'function', 'var ', 'const ', 'let ', 'fetch', 'document',
+        'window', 'eval', 'createElement', 'addEventListener', 'innerHTML',
+        'location', 'href', 'xhr', 'http', 'script', '.js', 'onclick',
+        'onload', 'onerror', 'setinterval', 'settimeout', 'atob',
+        '://','<script', '</script', 'alert(', 'console', 'return ',
+        'if ', 'for ', 'while ', '.length', '.replace', '.split'
+    ]
+    
+    matches = sum(1 for sig in code_signatures if sig in text_lower)
+    return matches >= 2  # At least 2 code signatures
+
+def is_printable_ascii(b):
+    """Check if byte is printable ASCII or common whitespace"""
+    return (32 <= b < 127) or b in [9, 10, 13, 0]  # Tab, LF, CR, Null
+
+# ============================================================================
+# TYPE 1: SIMPLE XOR DECODER (IMPROVED)
 # ============================================================================
 
 class SimpleXORDecoder:
-    """Decoder for simple XOR encrypted payloads"""
+    """Decoder for simple XOR encrypted payloads with multiple detection strategies"""
     
     KNOWN_KEYS = [
-        "secretkey",
-        "password",
-        "key12345",
-        "malware",
-        "decrypt",
-        "encode",
-        "hidden",
-        "payload",
+        "secretkey", "password", "key12345", "malware", "decrypt", 
+        "encode", "hidden", "payload", "secret", "admin", "test",
+        "key", "pass", "data", "crypto", "cipher", "xor", "encode",
+        "123456", "qwerty", "letmein", "welcome", "shadow",
     ]
     
     def __init__(self):
@@ -113,18 +149,156 @@ class SimpleXORDecoder:
         for match in matches:
             try:
                 char_codes = [int(x.strip()) for x in match.split(',')]
+                # Try to build key from printable chars
                 key = ''.join(chr(c) for c in char_codes if 32 <= c < 127)
-                if len(key) >= 3:
+                if len(key) >= 2:
                     self.detected_key = key
                     self.key_info = XORKey(
                         key_type="String.fromCharCode",
                         key_value=key,
-                        key_source=f"String.fromCharCode({match})",
+                        key_source=f"Extracted from JavaScript",
                         key_bytes=char_codes
                     )
                     return key
             except:
                 continue
+        return None
+    
+    def extract_potential_keys_from_svg(self, content):
+        """Extract potential keys from SVG attributes and variables"""
+        potential_keys = []
+        
+        # 1. Extract from hex attributes (data-key, data-k, etc)
+        hex_attrs = re.findall(r'data-\w+\s*=\s*["\']([0-9a-fA-F]{4,16})["\']', content)
+        for hex_val in hex_attrs:
+            # Convert hex to string
+            try:
+                key = bytes.fromhex(hex_val).decode('utf-8', errors='ignore')
+                if len(key) >= 2 and all(is_printable_ascii(ord(c)) for c in key):
+                    potential_keys.append((key, "hex_attribute"))
+            except:
+                pass
+        
+        # 2. Extract numeric seeds - sometimes used as XOR key
+        numeric_attrs = re.findall(r'data-\w+\s*=\s*["\'](\d{2,8})["\']', content)
+        for num_str in numeric_attrs:
+            try:
+                num = int(num_str)
+                # Try single byte and multi-byte interpretations
+                key = chr(num % 256)
+                potential_keys.append((key, f"numeric_seed_{num}"))
+            except:
+                pass
+        
+        # 3. Extract from variable assignments (var key = "...", etc)
+        var_strings = re.findall(r'(?:var|let|const)\s+(\w+)\s*=\s*["\']([^"\']{2,32})["\']', content)
+        for var_name, var_value in var_strings:
+            if 'key' in var_name.lower() or 'pwd' in var_name.lower() or 'secret' in var_name.lower():
+                potential_keys.append((var_value, f"variable_{var_name}"))
+        
+        # 4. Extract concatenated strings that might form keys
+        concat_pattern = r'["\']([^"\']{2,16})["\']\s*\+\s*["\']([^"\']{2,16})["\']'
+        concat_matches = re.findall(concat_pattern, content)
+        for part1, part2 in concat_matches:
+            combined = part1 + part2
+            potential_keys.append((combined, "concatenated_string"))
+        
+        # 5. Extract from style/onclick attributes
+        style_matches = re.findall(r'(?:style|onclick|data-payload)\s*=\s*["\']([^"\']{3,})["\']', content)
+        for match in style_matches:
+            # Check if looks like a key
+            if len(match) >= 3 and len(match) <= 32 and not match.startswith('http'):
+                potential_keys.append((match, "attribute_value"))
+        
+        return potential_keys
+    
+    def detect_key_by_magic_numbers(self, hex_payload):
+        """Find XOR key by looking for known strings in decoded output"""
+        if len(hex_payload) < 32:
+            return None
+        
+        # Try single-byte keys (0-255)
+        magic_strings = ['http', 'function', 'var ', 'fetch', 'document.', '.js', 'onclick']
+        
+        for key_byte in range(256):
+            try:
+                decoded = self.xor_decode(hex_payload[:200], chr(key_byte))
+                if any(magic in decoded.lower() for magic in magic_strings):
+                    self.detected_key = chr(key_byte)
+                    self.key_info = XORKey(
+                        key_type="Single-Byte XOR (Magic Number Detection)",
+                        key_value=f"0x{key_byte:02x} ('{chr(key_byte) if is_printable_ascii(key_byte) else '?'}')",
+                        key_source="Found by magic string detection",
+                        key_bytes=[key_byte]
+                    )
+                    return chr(key_byte)
+            except:
+                pass
+        
+        return None
+    
+    def detect_key_by_entropy(self, hex_payload):
+        """Find key with lowest entropy (most likely to be valid text)"""
+        if len(hex_payload) < 50:
+            return None
+        
+        import math
+        best_key = None
+        best_entropy = float('inf')
+        
+        sample_size = min(200, len(hex_payload))
+        
+        # Try common keys first (more likely)
+        for key in self.KNOWN_KEYS:
+            try:
+                decoded = self.xor_decode(hex_payload[:sample_size], key)
+                # Filter to printable characters
+                filtered = ''.join(c for c in decoded if is_printable_ascii(ord(c)))
+                
+                if len(filtered) > 10 and is_likely_code(filtered):
+                    entropy = calculate_entropy(filtered)
+                    if entropy < best_entropy:
+                        best_entropy = entropy
+                        best_key = key
+            except:
+                pass
+        
+        # If found with known keys, return it
+        if best_key:
+            self.detected_key = best_key
+            self.key_info = XORKey(
+                key_type="Known Key (Entropy Analysis)",
+                key_value=best_key,
+                key_source=f"Lowest entropy: {best_entropy:.2f}",
+                key_bytes=[ord(c) for c in best_key]
+            )
+            return best_key
+        
+        # Try potential extracted keys
+        potential = self.extract_potential_keys_from_svg("")  # Placeholder, pass actual content
+        for key, source in potential:
+            try:
+                decoded = self.xor_decode(hex_payload[:sample_size], key)
+                filtered = ''.join(c for c in decoded if is_printable_ascii(ord(c)))
+                
+                if len(filtered) > 10 and is_likely_code(filtered):
+                    entropy = calculate_entropy(filtered)
+                    if entropy < best_entropy:
+                        best_entropy = entropy
+                        best_key = key
+            except:
+                pass
+        
+        if best_key and best_entropy < float('inf'):
+            self.detected_key = best_key
+            self.key_info = XORKey(
+                key_type="Extracted Key (Entropy Analysis)",
+                key_value=best_key,
+                key_source=f"From SVG attributes, entropy: {best_entropy:.2f}",
+                key_bytes=[ord(c) for c in best_key]
+            )
+            return best_key
+        
         return None
     
     def detect_key_bruteforce(self, hex_payload):
@@ -135,10 +309,13 @@ class SimpleXORDecoder:
         for key in self.KNOWN_KEYS:
             try:
                 decoded = self.xor_decode(hex_payload[:100], key)
-                if any(x in decoded.lower() for x in ['function', 'var ', 'const ', 'let ', 'fetch', 'document']):
+                # Better ASCII filtering
+                filtered = ''.join(c for c in decoded if is_printable_ascii(ord(c)))
+                
+                if is_likely_code(filtered):
                     self.detected_key = key
                     self.key_info = XORKey(
-                        key_type="Known Key (Bruteforce)",
+                        key_type="Known Key (Bruteforce Match)",
                         key_value=key,
                         key_source="Matched against known key list",
                         key_bytes=[ord(c) for c in key]
@@ -149,25 +326,68 @@ class SimpleXORDecoder:
         return None
     
     def xor_decode(self, hex_string, key):
-        """XOR decode hex string with key"""
+        """XOR decode hex string with key - handles binary result"""
         result = []
-        key_len = len(key)
+        key_bytes = [ord(c) if isinstance(c, str) else c for c in key]
+        key_len = len(key_bytes)
         
         for i in range(0, len(hex_string), 2):
-            byte_val = int(hex_string[i:i+2], 16)
-            key_char = ord(key[(i // 2) % key_len])
-            result.append(chr(byte_val ^ key_char))
+            try:
+                byte_val = int(hex_string[i:i+2], 16)
+                key_byte = key_bytes[(i // 2) % key_len]
+                xor_result = byte_val ^ key_byte
+                result.append(xor_result)
+            except:
+                continue
         
-        return ''.join(result)
+        # Decode bytes to string, keeping only printable chars and common whitespace
+        output = []
+        for b in result:
+            if is_printable_ascii(b):
+                output.append(chr(b))
+        
+        return ''.join(output)
     
     def decode(self, hex_payload, content):
-        """Main decode function"""
+        """Main decode function - tries multiple strategies"""
+        # Strategy 1: Direct key extraction from JavaScript
         key = self.detect_key_from_charcode(content)
-        if not key:
-            key = self.detect_key_bruteforce(hex_payload)
-        
         if key:
             return self.xor_decode(hex_payload, key)
+        
+        # Strategy 2: Extract potential keys from SVG attributes and try them
+        potential_keys = self.extract_potential_keys_from_svg(content)
+        for potential_key, source in potential_keys:
+            try:
+                decoded = self.xor_decode(hex_payload[:200], potential_key)
+                filtered = ''.join(c for c in decoded if is_printable_ascii(ord(c)))
+                if is_likely_code(filtered) and len(filtered) > 10:
+                    self.detected_key = potential_key
+                    self.key_info = XORKey(
+                        key_type="Extracted Key (SVG Attribute)",
+                        key_value=potential_key,
+                        key_source=f"Extracted from: {source}",
+                        key_bytes=[ord(c) for c in potential_key]
+                    )
+                    return self.xor_decode(hex_payload, potential_key)
+            except:
+                pass
+        
+        # Strategy 3: Magic number detection (single-byte keys)
+        key = self.detect_key_by_magic_numbers(hex_payload)
+        if key:
+            return self.xor_decode(hex_payload, key)
+        
+        # Strategy 4: Standard bruteforce with known keys
+        key = self.detect_key_bruteforce(hex_payload)
+        if key:
+            return self.xor_decode(hex_payload, key)
+        
+        # Strategy 5: Entropy-based detection with SVG attributes
+        key = self.detect_key_by_entropy(hex_payload)
+        if key:
+            return self.xor_decode(hex_payload, key)
+        
         return None
 
 # ============================================================================
@@ -289,10 +509,13 @@ class LCGFeistelDecoder:
             decrypted
         )
         
-        output = ''.join(chr(b) for b in decrypted[:params['output_len']] 
-                        if 32 <= b < 127 or b in [9, 10, 13])
+        # Better ASCII handling - keep only valid characters
+        output = []
+        for b in decrypted[:params['output_len']]:
+            if is_printable_ascii(b):
+                output.append(chr(b))
         
-        return output
+        return ''.join(output)
 
 # ============================================================================
 # TYPE 3: DNA ENCODING + FIBONACCI XOR DECODER
@@ -415,10 +638,13 @@ class DNAFibonacciDecoder:
         for i in range(min(params['length'], len(dna_bytes))):
             decrypted.append(dna_bytes[i] ^ fib_key[i % 256])
         
-        # Convert to string
-        result = ''.join(chr(b) for b in decrypted if 32 <= b < 127 or b in [9, 10, 13])
+        # Better ASCII handling
+        result = []
+        for b in decrypted:
+            if is_printable_ascii(b):
+                result.append(chr(b))
         
-        return result
+        return ''.join(result)
 
 
 # ============================================================================
@@ -505,9 +731,16 @@ class DualKeyXORDecoder:
             result = []
             for i, byte in enumerate(decoded):
                 key_char = ord(combined_key[i % len(combined_key)])
-                result.append(chr(byte ^ key_char))
+                xor_result = byte ^ key_char
+                result.append(xor_result)
             
-            decrypted = ''.join(result)
+            # Better ASCII handling
+            decrypted = []
+            for b in result:
+                if is_printable_ascii(b):
+                    decrypted.append(chr(b))
+            
+            decrypted_str = ''.join(decrypted)
             
             self.key_info = XORKey(
                 key_type="Base64 + Dual-Key XOR",
@@ -526,7 +759,7 @@ class DualKeyXORDecoder:
                 'victim': components.get('victim', None)
             }
             
-            return decrypted
+            return decrypted_str
         except Exception as e:
             return None
 
@@ -568,14 +801,22 @@ class Base64Decoder:
             clean = re.sub(r'^[#$@!%^&*]+', '', clean).strip()
             
             if self.is_base64(clean):
-                decoded = base64.b64decode(clean).decode('utf-8', errors='ignore')
+                decoded_bytes = base64.b64decode(clean)
+                # Better ASCII handling
+                decoded = []
+                for b in decoded_bytes:
+                    if is_printable_ascii(b):
+                        decoded.append(chr(b))
+                
+                decoded_str = ''.join(decoded)
+                
                 self.key_info = XORKey(
                     key_type="Base64 Encoding",
                     key_value="Standard Base64",
                     key_source=f"Decoded from: {original[:40]}...",
                     key_bytes=["Alphabet: A-Za-z0-9+/="]
                 )
-                return decoded
+                return decoded_str
         except Exception as e:
             pass
         return None
@@ -842,13 +1083,13 @@ class SVGMalwareAnalyzer:
         return decoded_results
     
     def extract_iocs(self):
-        """Extract IOCs from decoded payload"""
+        """Extract IOCs from decoded payload - URLs, IPs, ports, domains, emails"""
         if not self.decoded_payload:
             return {}
         
         payload = self.decoded_payload
         
-        # Extract URLs
+        # ===== URLS =====
         urls = re.findall(r'https?://[^\s\'"<>\)]+', payload)
         
         # Reconstruct URLs from character arrays
@@ -859,10 +1100,8 @@ class SVGMalwareAnalyzer:
                     urls.append(url)
         
         # Try to decode atob() Base64 strings to find hidden URLs
-        # Pattern: atob(`xxx`+'yyy'+...)
         atob_match = re.search(r'atob\s*\(\s*([`"\'][^`"\']+[`"\']\s*\+?\s*)+\)', payload)
         if atob_match:
-            # Extract all the string parts
             parts = re.findall(r'[`"\']([^`"\']+)[`"\']', atob_match.group(0))
             if parts:
                 combined = ''.join(parts)
@@ -873,22 +1112,136 @@ class SVGMalwareAnalyzer:
                 except:
                     pass
         
-        # Extract domains
+        # ===== IP ADDRESSES & PORTS =====
+        # IPv4 addresses
+        ipv4_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+        ipv4_addresses = re.findall(ipv4_pattern, payload)
+        
+        # IPv6 addresses (simplified pattern)
+        ipv6_pattern = r'(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}'
+        ipv6_addresses = re.findall(ipv6_pattern, payload)
+        
+        # IP:PORT combinations
+        ip_port_pattern = r'(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?):(\d{1,5})'
+        ip_ports = re.findall(ip_port_pattern, payload)
+        
+        # Domain:PORT combinations
+        domain_port_pattern = r'([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*):(\d{1,5})'
+        domain_ports = re.findall(domain_port_pattern, payload)
+        
+        # ===== DOMAINS =====
         domains = set()
         for url in urls:
-            match = re.search(r'https?://([^/\s]+)', url)
+            match = re.search(r'https?://([^/\s:]+)', url)
             if match:
-                domains.add(match.group(1))
+                domain = match.group(1)
+                # Filter out standard W3C domains
+                if domain not in ['www.w3.org', 'w3.org', 'localhost', '127.0.0.1']:
+                    domains.add(domain)
         
-        domains = {d for d in domains if d not in ['www.w3.org', 'w3.org']}
+        # Add domains from domain:port patterns
+        for domain, port in domain_ports:
+            if domain not in ['www.w3.org', 'w3.org', 'localhost']:
+                domains.add(f"{domain}:{port}")
+        
+        # ===== EMAIL ADDRESSES =====
+        emails = set()
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        email_matches = re.findall(email_pattern, payload)
+        emails.update(email_matches)
+        if self.components.get('victim_email'):
+            emails.add(self.components.get('victim_email'))
+        
+        # ===== FILE PATHS =====
+        # Windows paths
+        win_paths = re.findall(r'[A-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*', payload)
+        # Linux paths
+        linux_paths = re.findall(r'/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]*', payload)
+        
+        # Filter common false positives
+        linux_paths = [p for p in linux_paths if len(p) > 3 and not p.endswith('/')]
+        
+        # ===== REGISTRY KEYS (Windows) =====
+        registry_keys = re.findall(r'(HKEY_\w+|HKCU|HKLM|HKCR)\\[\\a-zA-Z0-9_.-]+', payload)
+        
+        # ===== COMMAND LINE / POWERSHELL COMMANDS =====
+        powershell_cmds = re.findall(r'(?:powershell|pwsh|cmd|wmic)\s+(?:-[a-zA-Z]+\s+)?[^;"\n]+', payload, re.IGNORECASE)
         
         self.iocs = {
             'urls': list(set(urls)),
             'domains': list(domains),
+            'ipv4_addresses': list(set(ipv4_addresses)),
+            'ipv6_addresses': list(set(ipv6_addresses)),
+            'ports': list(set(ip_ports)),
+            'emails': list(emails),
+            'file_paths': list(set(win_paths + linux_paths)),
+            'registry_keys': list(set(registry_keys)),
+            'powershell_commands': list(set(powershell_cmds)),
             'victim_email': self.components.get('victim_email', None)
         }
         
         return self.iocs
+    
+    def detect_obfuscation(self):
+        """Detect various obfuscation techniques in the SVG/payload"""
+        obfuscation_indicators = []
+        
+        content = self.content
+        payload = self.decoded_payload or ""
+        combined = content + payload
+        
+        checks = [
+            # Base64 / Encoding
+            (r'atob\s*\(', 'Base64 Decoding (atob)', 'Payload contains Base64 decoder', 'MEDIUM'),
+            (r'btoa\s*\(', 'Base64 Encoding (btoa)', 'Payload encodes to Base64', 'MEDIUM'),
+            (r'decodeURIComponent\s*\(', 'URL Encoding', 'Uses URI component decoding', 'MEDIUM'),
+            (r'encodeURIComponent\s*\(', 'URL Encoding', 'Encodes URIs to evade detection', 'MEDIUM'),
+            
+            # Unicode/Hex Escaping
+            (r'\\u[0-9a-fA-F]{4}', 'Unicode Escaping', 'Uses Unicode escape sequences (\\uXXXX)', 'MEDIUM'),
+            (r'\\x[0-9a-fA-F]{2}', 'Hex Escaping', 'Uses hex escape sequences (\\xXX)', 'MEDIUM'),
+            (r'0x[0-9a-fA-F]+', 'Hex Literals', 'Uses hexadecimal numeric literals', 'LOW'),
+            
+            # Character Manipulation
+            (r'\.fromCharCode\s*\(', 'String.fromCharCode', 'Constructs strings from char codes', 'MEDIUM'),
+            (r'\.charCodeAt\s*\(', 'charCodeAt', 'Extracts character codes', 'MEDIUM'),
+            (r'\[["\'](.)["\']\]\.join', 'Character Array Join', 'Reconstructs strings from arrays', 'MEDIUM'),
+            
+            # Variable/Function Obfuscation
+            (r'_0x[a-f0-9]{4,}', 'Hex Variable Names', 'Variables named with hex (_0xXXXX pattern)', 'MEDIUM'),
+            (r'\b[a-z]=[a-z]\.replace\([^)]+,[^)]+\)', 'String Replace', 'Uses replace() for obfuscation', 'MEDIUM'),
+            
+            # Code Execution
+            (r'eval\s*\(', 'eval() Usage', 'Uses eval() for dynamic code execution', 'CRITICAL'),
+            (r'Function\s*\(', 'Function Constructor', 'Creates functions dynamically', 'HIGH'),
+            (r'constructor\s*\[\s*["\']constructor["\']', 'Constructor Chain', 'Uses constructor property chain', 'HIGH'),
+            (r'return\s+function', 'Nested Functions', 'Returns anonymous/nested functions', 'MEDIUM'),
+            
+            # Data Obfuscation
+            (r'\|', 'Pipe Delimiter', 'Uses pipe character to separate data', 'LOW'),
+            (r';/', 'Comment After Semicolon', 'Suspicious ;/ pattern', 'MEDIUM'),
+            
+            # Compression
+            (r'decompress|inflate|gzip', 'Compression Detection', 'Payload may be compressed', 'HIGH'),
+            
+            # Polymorphism
+            (r'\d+\.\d+\.\d+\.\d+\.\d+\.\d+', 'Parameter Mutation', 'Encrypted parameters suggest polymorphic code', 'HIGH'),
+            
+            # DOM/Context Manipulation
+            (r'document\s*\[\s*["\']write["\']', 'document.write via bracket notation', 'Obfuscated DOM manipulation', 'HIGH'),
+            (r'window\s*\[\s*["\']location', 'window.location via bracket notation', 'Obfuscated window property access', 'HIGH'),
+        ]
+        
+        for pattern, obf_type, description, severity in checks:
+            if re.search(pattern, combined, re.IGNORECASE):
+                obfuscation_indicators.append({
+                    'type': obf_type,
+                    'description': description,
+                    'severity': severity,
+                    'pattern': pattern
+                })
+        
+        return obfuscation_indicators
     
     def analyze_behavior(self):
         """Analyze malicious behaviors"""
@@ -1080,17 +1433,65 @@ class SVGMalwareAnalyzer:
         report.append(f"{'─'*80}")
         report.append(f" INDICATORS OF COMPROMISE (IOCs)")
         report.append(f"{'─'*80}")
+        
+        # Domains
         if self.iocs.get('domains'):
-            report.append(f"   C2 Domains:")
+            report.append(f"   🌐 C2 Domains:")
             for domain in self.iocs['domains']:
-                report.append(f"     → {domain}")
+                report.append(f"      → {domain}")
+        
+        # URLs
         if self.iocs.get('urls'):
-            report.append(f"   URLs:")
+            report.append(f"   🔗 URLs:")
             for url in self.iocs['urls']:
                 if 'w3.org' not in url:
-                    report.append(f"     → {url}")
+                    report.append(f"      → {url}")
+        
+        # IP Addresses
+        if self.iocs.get('ipv4_addresses'):
+            report.append(f"   📡 IPv4 Addresses:")
+            for ip in self.iocs['ipv4_addresses']:
+                report.append(f"      → {ip}")
+        
+        if self.iocs.get('ipv6_addresses'):
+            report.append(f"   📡 IPv6 Addresses:")
+            for ip in self.iocs['ipv6_addresses']:
+                report.append(f"      → {ip}")
+        
+        # Ports
+        if self.iocs.get('ports'):
+            report.append(f"   🔌 Ports Detected:")
+            for port in self.iocs['ports']:
+                report.append(f"      → {port}")
+        
+        # Email Addresses
+        if self.iocs.get('emails'):
+            report.append(f"   📧 Email Addresses:")
+            for email in self.iocs['emails']:
+                report.append(f"      → {email}")
+        
+        # File Paths
+        if self.iocs.get('file_paths'):
+            report.append(f"   📁 File Paths:")
+            for path in self.iocs['file_paths']:
+                report.append(f"      → {path}")
+        
+        # Registry Keys
+        if self.iocs.get('registry_keys'):
+            report.append(f"   🔑 Registry Keys:")
+            for key in self.iocs['registry_keys']:
+                report.append(f"      → {key}")
+        
+        # PowerShell Commands
+        if self.iocs.get('powershell_commands'):
+            report.append(f"   ⚙️  PowerShell Commands:")
+            for cmd in self.iocs['powershell_commands'][:5]:  # Limit to first 5
+                report.append(f"      → {cmd}")
+        
+        # Victim
         if self.iocs.get('victim_email'):
-            report.append(f"   Victim: {self.iocs['victim_email']}")
+            report.append(f"   👤 Victim Email: {self.iocs['victim_email']}")
+        
         report.append("")
         
         # Behaviors
@@ -1103,6 +1504,20 @@ class SVGMalwareAnalyzer:
             report.append(f"      └─ {behavior['description']}")
         if not self.behaviors:
             report.append(f"   No behaviors detected")
+        report.append("")
+        
+        # Obfuscation Techniques
+        obfuscation = self.detect_obfuscation()
+        report.append(f"{'─'*80}")
+        report.append(f" OBFUSCATION TECHNIQUES DETECTED")
+        report.append(f"{'─'*80}")
+        if obfuscation:
+            for obf in obfuscation:
+                severity_icon = "🔴" if obf['severity'] in ['HIGH', 'CRITICAL'] else "🟡"
+                report.append(f"   {severity_icon} [{obf['severity']}] {obf['type']}")
+                report.append(f"      └─ {obf['description']}")
+        else:
+            report.append(f"   No obfuscation techniques detected")
         report.append("")
         
         # File drop
@@ -1193,14 +1608,32 @@ Examples:
         results = analyzer.decode_payload()
         if results:
             print(f"  {Colors.GREEN}✓ Payload decoded successfully!{Colors.END}")
+            if analyzer.key_info:
+                print(f"  {Colors.BLUE}  Decryption Method: {analyzer.key_info.type}{Colors.END}")
+                print(f"  {Colors.BLUE}  Key/Method: {analyzer.key_info.value}{Colors.END}")
         else:
             print(f"  {Colors.RED}✗ Failed to decode payload{Colors.END}")
         
-        print(f"\n{Colors.CYAN}[STEP 4] Extracting IOCs...{Colors.END}")
-        iocs = analyzer.extract_iocs()
+        print(f"\n{Colors.CYAN}[STEP 4] Detecting obfuscation techniques...{Colors.END}")
+        obfuscation = analyzer.detect_obfuscation()
+        if obfuscation:
+            print(f"  {Colors.YELLOW}Found {len(obfuscation)} obfuscation technique(s){Colors.END}")
+            for obf in obfuscation[:5]:  # Show first 5
+                print(f"    • {obf['type']}: {obf['description']}")
+        else:
+            print(f"  {Colors.GREEN}✓ No major obfuscation detected{Colors.END}")
         
-        print(f"\n{Colors.CYAN}[STEP 5] Analyzing behaviors...{Colors.END}")
+        print(f"\n{Colors.CYAN}[STEP 5] Extracting IOCs...{Colors.END}")
+        iocs = analyzer.extract_iocs()
+        ioc_count = sum(len(v) if isinstance(v, list) else (1 if v else 0) for v in iocs.values())
+        print(f"  {Colors.GREEN}Found {ioc_count} IOCs{Colors.END}")
+        
+        print(f"\n{Colors.CYAN}[STEP 6] Analyzing behaviors...{Colors.END}")
         behaviors = analyzer.analyze_behavior()
+        if behaviors:
+            print(f"  {Colors.YELLOW}Detected {len(behaviors)} malicious behaviors{Colors.END}")
+        else:
+            print(f"  {Colors.GREEN}No overt behavioral signatures detected{Colors.END}")
         
         report = analyzer.generate_report(raw_output=False)
         print(report)
